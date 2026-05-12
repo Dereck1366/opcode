@@ -16,37 +16,18 @@ import { Popover } from "@/components/ui/popover";
 import { api, type Session } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-// Conditional imports for Tauri APIs
-let tauriListen: any;
-type UnlistenFn = () => void;
+import { listen as tauriListen, type UnlistenFn } from '@tauri-apps/api/event';
 
-try {
-  if (typeof window !== 'undefined' && window.__TAURI__) {
-    tauriListen = require("@tauri-apps/api/event").listen;
-  }
-} catch (e) {
-  console.log('[ClaudeCodeSession] Tauri APIs not available, using web mode');
-}
-
-// Web-compatible replacements
-const listen = tauriListen || ((eventName: string, callback: (event: any) => void) => {
-  console.log('[ClaudeCodeSession] Setting up DOM event listener for:', eventName);
-
-  // In web mode, listen for DOM events
-  const domEventHandler = (event: any) => {
-    console.log('[ClaudeCodeSession] DOM event received:', eventName, event.detail);
-    // Simulate Tauri event structure
-    callback({ payload: event.detail });
-  };
-
-  window.addEventListener(eventName, domEventHandler);
-
-  // Return unlisten function
-  return Promise.resolve(() => {
-    console.log('[ClaudeCodeSession] Removing DOM event listener for:', eventName);
-    window.removeEventListener(eventName, domEventHandler);
+// Unified listen: Tauri IPC in desktop mode, DOM CustomEvents as web-mode fallback.
+// Previously used require() which is unavailable in Vite production ESM bundles,
+// causing all streaming events to silently drop.
+function listen(eventName: string, callback: (event: any) => void): Promise<UnlistenFn> {
+  return tauriListen(eventName, callback).catch(() => {
+    const handler = (e: Event) => callback({ payload: (e as CustomEvent).detail });
+    window.addEventListener(eventName, handler);
+    return () => window.removeEventListener(eventName, handler);
   });
-});
+}
 import { StreamMessage } from "./StreamMessage";
 import { FloatingPromptInput, type FloatingPromptInputRef } from "./FloatingPromptInput";
 import { ErrorBoundary } from "./ErrorBoundary";
@@ -473,15 +454,70 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
       if (isMountedRef.current) {
         setIsLoading(false);
         hasActiveSessionRef.current = false;
+        isListeningRef.current = false;
+        unlistenRefs.current.forEach(u => u());
+        unlistenRefs.current = [];
       }
     });
 
     unlistenRefs.current = [outputUnlisten, errorUnlisten, completeUnlisten];
-    
+
     // Mark as loading to show the session is active
     if (isMountedRef.current) {
       setIsLoading(true);
       hasActiveSessionRef.current = true;
+    }
+
+    // Replay any output buffered before our listeners were registered, then verify the
+    // session is still alive. There is a race between checkForActiveSession and listener
+    // setup: Claude may finish in that window so claude-complete never fires, leaving
+    // isLoading=true and isListeningRef=true forever (next prompt silently queued).
+    try {
+      const bufferedOutput = await api.getClaudeSessionOutput(sessionId);
+      if (bufferedOutput && isMountedRef.current) {
+        const lines = bufferedOutput.split('\n').filter((line: string) => line.trim());
+        const bufferedMessages: ClaudeStreamMessage[] = [];
+        for (const line of lines) {
+          try {
+            bufferedMessages.push(JSON.parse(line) as ClaudeStreamMessage);
+          } catch { /* skip malformed lines */ }
+        }
+        if (bufferedMessages.length > 0) {
+          setMessages(prev => {
+            const newOnes = bufferedMessages.slice(prev.length);
+            return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
+          });
+          setRawJsonlOutput(prev => {
+            const newLines = lines.slice(prev.length);
+            return newLines.length > 0 ? [...prev, ...newLines] : prev;
+          });
+        }
+      }
+    } catch (err) {
+      console.error('[ClaudeCodeSession] Failed to fetch buffered output on reconnect:', err);
+    }
+
+    // Verify the session is still running after listener setup. If it finished during
+    // the setup window, release the loading state so the user can send new messages.
+    try {
+      const activeSessions = await api.listRunningClaudeSessions();
+      const stillActive = activeSessions.some((s: any) => {
+        if ('process_type' in s && s.process_type && 'ClaudeSession' in s.process_type) {
+          return (s.process_type as any).ClaudeSession.session_id === sessionId;
+        }
+        return false;
+      });
+
+      if (!stillActive && isMountedRef.current && isListeningRef.current) {
+        console.log('[ClaudeCodeSession] Session finished before listeners were ready, releasing state');
+        setIsLoading(false);
+        hasActiveSessionRef.current = false;
+        isListeningRef.current = false;
+        unlistenRefs.current.forEach(u => u());
+        unlistenRefs.current = [];
+      }
+    } catch (err) {
+      console.error('[ClaudeCodeSession] Failed to verify session status on reconnect:', err);
     }
   };
 

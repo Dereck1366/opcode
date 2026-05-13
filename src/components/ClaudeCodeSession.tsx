@@ -728,7 +728,24 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
               sessionMetrics.current.errorsEncountered += 1;
             }
 
-            setMessages((prev) => [...prev, message]);
+            if (message.type === 'user' && !message.isMeta) {
+              // Replace the optimistic placeholder added in handleSendPrompt instead of
+              // appending a duplicate. The stream echoes back the user's message within
+              // milliseconds; without this the message appears twice and the original
+              // scrolls out of view when the response arrives.
+              setMessages(prev => {
+                let idx = -1;
+                for (let i = prev.length - 1; i >= 0; i--) { if (prev[i]._optimistic) { idx = i; break; } }
+                if (idx !== -1) {
+                  const next = [...prev];
+                  next[idx] = message;
+                  return next;
+                }
+                return [...prev, message];
+              });
+            } else {
+              setMessages((prev) => [...prev, message]);
+            }
           } catch (err) {
             console.error('Failed to parse message:', err, payload);
           }
@@ -860,7 +877,8 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
                 text: prompt
               }
             ]
-          }
+          },
+          _optimistic: true,
         };
         setMessages(prev => [...prev, userMessage]);
         

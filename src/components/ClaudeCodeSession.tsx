@@ -637,15 +637,20 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
           }
         });
 
+        // Dedup set: prevents the same message being processed twice when both
+        // generic and session-specific listeners are briefly active simultaneously
+        // (Rust emits to both channels; see dual-channel emission in claude.rs).
+        const processedPayloads = new Set<string>();
+
         // Helper to process any JSONL stream message string or object
         function handleStreamMessage(payload: string | ClaudeStreamMessage) {
           try {
             // Don't process if component unmounted
             if (!isMountedRef.current) return;
-            
+
             let message: ClaudeStreamMessage;
             let rawPayload: string;
-            
+
             if (typeof payload === 'string') {
               // Tauri mode: payload is a JSON string
               rawPayload = payload;
@@ -655,6 +660,10 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
               message = payload;
               rawPayload = JSON.stringify(payload);
             }
+
+            // Skip if already processed on another channel (dedup guard)
+            if (processedPayloads.has(rawPayload)) return;
+            processedPayloads.add(rawPayload);
             
             console.log('[ClaudeCodeSession] handleStreamMessage - message type:', message.type);
 

@@ -125,6 +125,10 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
   const queuedPromptsRef = useRef<Array<{ id: string; prompt: string; model: "sonnet" | "opus" }>>([]);
   const isMountedRef = useRef(true);
   const isListeningRef = useRef(false);
+  // Dedup set shared across ALL listener paths (reconnect + generic + scoped).
+  // Prevents the same raw payload from being appended more than once when Rust
+  // emits on both generic and session-scoped channels simultaneously.
+  const processedPayloadsRef = useRef(new Set<string>());
   const sessionStartTime = useRef<number>(Date.now());
   const isIMEComposingRef = useRef(false);
   
@@ -423,19 +427,26 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
     
     // Mark as listening
     isListeningRef.current = true;
-    
+    // Clear dedup set for this new streaming session
+    processedPayloadsRef.current.clear();
+
     // Set up session-specific listeners
     const outputUnlisten = await listen(`claude-output:${sessionId}`, async (event: any) => {
       try {
         console.log('[ClaudeCodeSession] Received claude-output on reconnect:', event.payload);
-        
+
         if (!isMountedRef.current) return;
-        
+
+        // Dedup: Rust emits on both generic and scoped channels simultaneously.
+        const rawPayload: string = event.payload;
+        if (processedPayloadsRef.current.has(rawPayload)) return;
+        processedPayloadsRef.current.add(rawPayload);
+
         // Store raw JSONL
-        setRawJsonlOutput(prev => [...prev, event.payload]);
-        
+        setRawJsonlOutput(prev => [...prev, rawPayload]);
+
         // Parse and display
-        const message = JSON.parse(event.payload) as ClaudeStreamMessage;
+        const message = JSON.parse(rawPayload) as ClaudeStreamMessage;
         setMessages(prev => [...prev, message]);
       } catch (err) {
         console.error("Failed to parse message:", err, event.payload);
@@ -560,6 +571,8 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
         
         // Mark as setting up listeners
         isListeningRef.current = true;
+        // Clear dedup set for this new streaming session
+        processedPayloadsRef.current.clear();
         
         // --------------------------------------------------------------------
         // 1️⃣  Event Listener Setup Strategy
@@ -637,11 +650,6 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
           }
         });
 
-        // Dedup set: prevents the same message being processed twice when both
-        // generic and session-specific listeners are briefly active simultaneously
-        // (Rust emits to both channels; see dual-channel emission in claude.rs).
-        const processedPayloads = new Set<string>();
-
         // Helper to process any JSONL stream message string or object
         function handleStreamMessage(payload: string | ClaudeStreamMessage) {
           try {
@@ -661,9 +669,10 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
               rawPayload = JSON.stringify(payload);
             }
 
-            // Skip if already processed on another channel (dedup guard)
-            if (processedPayloads.has(rawPayload)) return;
-            processedPayloads.add(rawPayload);
+            // Skip if already processed on another channel (dedup guard).
+            // Uses a component-level ref so ALL listener paths share the same set.
+            if (processedPayloadsRef.current.has(rawPayload)) return;
+            processedPayloadsRef.current.add(rawPayload);
             
             console.log('[ClaudeCodeSession] handleStreamMessage - message type:', message.type);
 

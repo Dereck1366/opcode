@@ -1228,10 +1228,6 @@ async fn spawn_claude_process(
         while let Ok(Some(line)) = lines.next_line().await {
             log::debug!("Claude stdout: {}", line);
 
-            // Snapshot whether session ID was already known BEFORE we process this
-            // line. This lets us decide which channel(s) to use after extraction.
-            let had_session_id = session_id_holder_clone.lock().unwrap().is_some();
-
             // Parse the line to check for init message with session ID
             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
                 if msg["type"] == "system" && msg["subtype"] == "init" {
@@ -1268,31 +1264,12 @@ async fn spawn_claude_process(
                 let _ = registry_clone.append_live_output(run_id, &line);
             }
 
-            // Emit to the appropriate channel(s).
-            //
-            // Root-cause of the double-message bug: Rust was always emitting to BOTH
-            // the generic `claude-output` channel AND the session-scoped
-            // `claude-output:<sid>` channel. The frontend had both listeners active
-            // briefly, so every message was processed twice.
-            //
-            // Fix: once the session ID is established, emit ONLY on the scoped channel.
-            // For the very first `system:init` message (had_session_id = false) we
-            // also emit on the generic channel so the frontend's bootstrap listener
-            // can detect the session ID and switch to scoped listeners.
-            if had_session_id {
-                // Session ID was already known → scoped channel only, no duplication.
-                if let Some(ref session_id) = *session_id_holder_clone.lock().unwrap() {
-                    let _ = app_handle.emit(&format!("claude-output:{}", session_id), &line);
-                }
-            } else {
-                // Session ID was not yet known (this is system:init or an early line).
-                // Emit on generic so the frontend bootstrap listener receives it.
-                let _ = app_handle.emit("claude-output", &line);
-                // Also emit on scoped in case reconnect listeners are already active.
-                if let Some(ref session_id) = *session_id_holder_clone.lock().unwrap() {
-                    let _ = app_handle.emit(&format!("claude-output:{}", session_id), &line);
-                }
+            // Emit the line to the frontend with session isolation if we have session ID
+            if let Some(ref session_id) = *session_id_holder_clone.lock().unwrap() {
+                let _ = app_handle.emit(&format!("claude-output:{}", session_id), &line);
             }
+            // Also emit to the generic event for backward compatibility
+            let _ = app_handle.emit("claude-output", &line);
         }
     });
 
